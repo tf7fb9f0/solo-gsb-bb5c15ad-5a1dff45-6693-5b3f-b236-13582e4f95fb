@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from . import db as db_module
 from . import dependencies as dependency_core
 from . import holds as hold_core
+from . import proposals as proposal_core
 from . import reservations as reservation_core
 from . import room_assignments as room_assignment_core
 from . import scheduling
@@ -29,6 +30,13 @@ from .holds import (
     HoldExpiredError,
     HoldKeyConflictError,
     HoldNotFoundError,
+)
+from .proposals import (
+    ProposalContentConflictError,
+    ProposalNotFoundError,
+    ProposalNotPendingError,
+    ProposalVoteConflictError,
+    ProposalVoterNotAllowedError,
 )
 from .room_assignments import (
     BatchContentConflictError,
@@ -56,6 +64,10 @@ from .schemas import (
     MeetingRoomIn,
     MeetingRoomOut,
     ParticipantIn,
+    ProposalVoteIn,
+    ProposalVoteOut,
+    RescheduleProposalIn,
+    RescheduleProposalOut,
     ReservationDependencyIn,
     ReservationDependencyOut,
     ReservationHistoryOut,
@@ -119,8 +131,17 @@ app = FastAPI(
         "无解返回 409 并列出无法分配的预约、已有分配不变；结果确定性"
         "（总空余座位最少优先，再按预约 id、room_id 字典序取解）；"
         "预约改期/取消/交换会在各自事务内释放其会议室分配。"
+        "另提供预约改期提案（reschedule proposals）：提交 proposal_id"
+        "（幂等键）、reservation_id、expected_version、新时段/参与者与"
+        "去重必批人建提案（同键同内容幂等、异内容 409）；每位必批人可"
+        "approve 或 reject 一次（重复同票幂等、改票 409），任一 reject "
+        "立即使提案终止；最后一票 approve 在同一 BEGIN IMMEDIATE 事务内"
+        "确认预约仍为 expected_version 且 active，复用现有预约/保留冲突"
+        "与可达依赖校验后执行改期、追加 rescheduled 审计事件并释放会议室"
+        "分配——任一步失败返回 409，提案仍 pending 且预约不变，"
+        "并发最后投票只能提交一次。"
     ),
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -282,6 +303,49 @@ async def batch_unsolvable_handler(
     return JSONResponse(
         status_code=409,
         content={"detail": str(exc), "unassignable": exc.unassignable},
+    )
+
+
+@app.exception_handler(ProposalNotFoundError)
+async def proposal_not_found_handler(
+    request, exc: ProposalNotFoundError
+) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(ProposalContentConflictError)
+async def proposal_content_conflict_handler(
+    request, exc: ProposalContentConflictError
+) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(ProposalVoterNotAllowedError)
+async def proposal_voter_not_allowed_handler(
+    request, exc: ProposalVoterNotAllowedError
+) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(ProposalVoteConflictError)
+async def proposal_vote_conflict_handler(
+    request, exc: ProposalVoteConflictError
+) -> JSONResponse:
+    # 改票：给出该必批人已投的票
+    return JSONResponse(
+        status_code=409,
+        content={"detail": str(exc), "existing_decision": exc.existing_decision},
+    )
+
+
+@app.exception_handler(ProposalNotPendingError)
+async def proposal_not_pending_handler(
+    request, exc: ProposalNotPendingError
+) -> JSONResponse:
+    # 提案已终态：给出当前状态
+    return JSONResponse(
+        status_code=409,
+        content={"detail": str(exc), "status": exc.status},
     )
 
 
@@ -922,3 +986,115 @@ def get_room_assignment_batch(batch_id: str) -> RoomAssignmentBatchOut:
     本接口反映最新状态（可能少于求解时的条数）。
     """
     return _batch_to_out(room_assignment_core.get_batch(batch_id))
+
+
+# ------------------------------------------------- reschedule proposals
+
+
+def _proposal_to_out(
+    p: proposal_core.Proposal, r: reservation_core.Reservation
+) -> RescheduleProposalOut:
+    return RescheduleProposalOut(
+        proposal_id=p.proposal_id,
+        reservation_id=p.reservation_id,
+        expected_version=p.expected_version,
+        start_utc=_iso_z(p.start_utc),
+        end_utc=_iso_z(p.end_utc),
+        participants=list(p.participants),
+        approvers=list(p.approvers),
+        status=p.status,
+        created_at=_iso_z(p.created_at),
+        decided_at=_iso_z(p.decided_at) if p.decided_at is not None else None,
+        votes=[
+            ProposalVoteOut(
+                voter_id=v.voter_id,
+                decision=v.decision,
+                voted_at=_iso_z(v.voted_at),
+            )
+            for v in p.votes
+        ],
+        reservation=_reservation_to_out(r),
+    )
+
+
+@app.post(
+    "/api/v1/reschedule-proposals",
+    response_model=RescheduleProposalOut,
+    status_code=201,
+)
+def create_reschedule_proposal(
+    req: RescheduleProposalIn, response: Response
+) -> RescheduleProposalOut:
+    """创建预约改期提案：全员必批通过后才在同事务内执行改期。
+
+    整个流程在单个 ``BEGIN IMMEDIATE`` 事务内完成：
+
+    - 目标预约不存在 → ``404``；建提案**不**校验版本与 active 状态
+      （这些在最后一票 approve 时于同一事务强制，提案 pending 期间
+      预约可正常被他人改期/取消）；
+    - 相同 ``proposal_id`` + 相同规范化内容（目标预约、期望版本、新起止、
+      去重排序参与者、去重排序必批人）重试 → ``200`` 返回原提案
+      （含其当前状态与已收票），不新增记录；同键内容不同 → ``409``；
+    - 成功 → ``201``，提案状态为 ``pending``。
+    """
+    proposal, reservation, created = proposal_core.create_proposal(
+        proposal_id=req.proposal_id,
+        reservation_id=req.reservation_id,
+        expected_version=req.expected_version,
+        start_utc=req.start_utc,
+        end_utc=req.end_utc,
+        participant_ids=req.participant_ids,
+        approver_ids=req.approver_ids,
+    )
+    if not created:
+        # 幂等重放：返回原提案当前状态
+        response.status_code = 200
+    return _proposal_to_out(proposal, reservation)
+
+
+@app.get(
+    "/api/v1/reschedule-proposals/{proposal_id}",
+    response_model=RescheduleProposalOut,
+)
+def get_reschedule_proposal(proposal_id: str) -> RescheduleProposalOut:
+    """查询改期提案：状态、已收票与目标预约当前状态；不存在 → ``404``。"""
+    proposal, reservation = proposal_core.get_proposal(proposal_id)
+    return _proposal_to_out(proposal, reservation)
+
+
+@app.post(
+    "/api/v1/reschedule-proposals/{proposal_id}/votes",
+    response_model=RescheduleProposalOut,
+    status_code=201,
+)
+def vote_on_reschedule_proposal(
+    proposal_id: str, req: ProposalVoteIn, response: Response
+) -> RescheduleProposalOut:
+    """对改期提案投票（每位必批人限一次）。
+
+    整个流程在单个 ``BEGIN IMMEDIATE`` 事务内完成：
+
+    - 提案不存在 → ``404``；投票人不在必批人列表 → ``409``；
+    - 该必批人已投票：重复同票 → ``200`` 幂等返回当前提案；
+      改票 → ``409``（``existing_decision`` 给出已投的票）；
+    - 提案已终态（approved/rejected）→ ``409``（``status`` 给出当前状态）；
+    - ``reject`` → ``201``，提案立即终止为 ``rejected``；
+    - ``approve`` → ``201``；若此为**最后一票**（必批人全员批准），
+      在同一事务内确认预约仍为 ``expected_version`` 且 ``active``，
+      复用现有预约/保留半开区间冲突检查（排除自身）与可达时序依赖重验，
+      然后执行改期（version+1）、追加 ``rescheduled`` 哈希链审计事件并
+      释放该预约的会议室分配，提案置为 ``approved``；
+      任一步失败 → ``409``（版本不符/已取消/冲突/依赖违反，结构与
+      ``PUT /api/v1/reservations/{id}`` 一致），**整个事务回滚**：
+      提案仍 ``pending``（该票也不落库）、预约不变，可稍后重试同一票；
+    - 并发的最后一票只有一票能提交执行，其余成为幂等重放或收到 ``409``。
+    """
+    proposal, reservation, recorded = proposal_core.vote_on_proposal(
+        proposal_id=proposal_id,
+        voter_id=req.voter_id,
+        decision=req.decision,
+    )
+    if not recorded:
+        # 重复同票：幂等返回当前提案
+        response.status_code = 200
+    return _proposal_to_out(proposal, reservation)

@@ -137,6 +137,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_room_assignments_reservation
     ON room_assignments (reservation_id);
 CREATE INDEX IF NOT EXISTS idx_room_assignments_room
     ON room_assignments (room_id);
+CREATE TABLE IF NOT EXISTS reschedule_proposals (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id      TEXT NOT NULL UNIQUE,  -- 客户端幂等键
+    reservation_id   INTEGER NOT NULL REFERENCES reservations(id),  -- 目标预约
+    expected_version INTEGER NOT NULL,  -- 提案基于的预约乐观锁版本（最后一票 approve 时校验）
+    start_utc        TEXT NOT NULL,     -- 新时段（UTC 定宽文本）
+    end_utc          TEXT NOT NULL,
+    participants_key TEXT NOT NULL,  -- 规范化新参与者（去重排序后的 JSON）
+    approvers_key    TEXT NOT NULL,  -- 规范化必批人（去重排序后的 JSON）
+    status           TEXT NOT NULL DEFAULT 'pending',  -- pending=待批准；approved=已执行；rejected=已否决（终态）
+    created_at       TEXT NOT NULL,
+    decided_at       TEXT            -- 进入终态（approved/rejected）的时刻；pending 为 NULL
+);
+CREATE TABLE IF NOT EXISTS reschedule_proposal_votes (
+    proposal_pk INTEGER NOT NULL REFERENCES reschedule_proposals(id) ON DELETE CASCADE,
+    voter_id    TEXT NOT NULL,       -- 必批人 id；每人至多一票（主键约束）
+    decision    TEXT NOT NULL,       -- approve / reject
+    voted_at    TEXT NOT NULL,
+    PRIMARY KEY (proposal_pk, voter_id)
+);
 """
 
 _init_lock = threading.Lock()
@@ -185,6 +205,9 @@ def init_db(db_path: str | None = None) -> None:
       ``CREATE TABLE IF NOT EXISTS`` 幂等无损建立，不影响任何既有数据。
     - ``meeting_rooms`` / ``room_assignment_batches`` / ``room_assignments``
       （会议室与批量分配表）同样以 ``CREATE TABLE IF NOT EXISTS``
+      幂等无损建立，不影响任何既有数据。
+    - ``reschedule_proposals`` / ``reschedule_proposal_votes``
+      （改期提案与投票表）同样以 ``CREATE TABLE IF NOT EXISTS``
       幂等无损建立，不影响任何既有数据。
     """
     path = db_path or get_db_path()

@@ -509,3 +509,96 @@ class RoomAssignmentRecordOut(BaseModel):
     room_capacity: int
     spare_seats: int
     created_at: str
+
+
+class RescheduleProposalIn(_ReservationWindowBase):
+    """改期提案创建请求：幂等 proposal_id + 目标预约/期望版本 + 新时段/参与者 + 必批人。"""
+
+    proposal_id: str = Field(
+        min_length=1, max_length=200,
+        description=(
+            "客户端幂等请求标识：相同标识 + 相同规范化内容（目标预约、期望版本、"
+            "新起止、去重排序参与者、去重排序必批人）重试返回原提案；"
+            "标识相同但内容不同返回 409"
+        ),
+        examples=["prop-7f2a"],
+    )
+    reservation_id: int = Field(
+        ge=1,
+        description="目标预约 ID（改期对象）",
+        examples=[1],
+    )
+    expected_version: int = Field(
+        ge=1,
+        description=(
+            "提案基于的预约乐观锁版本：最后一票 approve 时预约仍须为该版本"
+            "且 active，否则执行失败（409），提案保持 pending"
+        ),
+        examples=[1],
+    )
+    approver_ids: list[str] = Field(
+        min_length=1,
+        description="必批人 ID 列表；去重排序后存储，全员 approve 才执行改期",
+        examples=[["alice", "bob"]],
+    )
+
+    @field_validator("approver_ids")
+    @classmethod
+    def _validate_approver_ids(cls, v: list[str]) -> list[str]:
+        if any(not a.strip() for a in v):
+            raise ValueError("approver ids must be non-empty")
+        return v
+
+
+class ProposalVoteIn(BaseModel):
+    """提案投票请求：必批人投 approve 或 reject（每人限一次）。"""
+
+    voter_id: str = Field(
+        min_length=1, max_length=200,
+        description="投票人 ID；须在提案的必批人列表中",
+        examples=["alice"],
+    )
+    decision: Literal["approve", "reject"] = Field(
+        description=(
+            "approve=批准（全员批准即在同事务内执行改期）；"
+            "reject=否决（任一否决立即使提案终止）"
+        ),
+    )
+
+
+class ProposalVoteOut(BaseModel):
+    """一票已记录的必批人投票。"""
+
+    voter_id: str
+    decision: Literal["approve", "reject"]
+    voted_at: str = Field(description="投票时刻（UTC ISO 8601）")
+
+
+class RescheduleProposalOut(BaseModel):
+    """改期提案状态（含已收票与目标预约当前状态）。"""
+
+    proposal_id: str
+    reservation_id: int
+    expected_version: int
+    start_utc: str = Field(description="新时段 UTC 开始时间 ISO 8601")
+    end_utc: str
+    participants: list[str] = Field(description="新参与者 id，去重后按字典序排列")
+    approvers: list[str] = Field(description="必批人 id，去重后按字典序排列")
+    status: Literal["pending", "approved", "rejected"] = Field(
+        description=(
+            "提案状态：pending=待批准；approved=全员批准且改期已执行；"
+            "rejected=有人否决（终态）"
+        ),
+        examples=["pending"],
+    )
+    created_at: str
+    decided_at: str | None = Field(
+        default=None,
+        description="进入终态（approved/rejected）的时刻 ISO 8601；pending 为 null",
+    )
+    votes: list[ProposalVoteOut] = Field(
+        description="已收票（按投票时刻、投票人字典序）",
+    )
+    reservation: ReservationOut = Field(
+        description="目标预约的当前最新状态（approved 后即为改期结果）",
+    )
