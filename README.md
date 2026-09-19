@@ -7,7 +7,9 @@
 **预约临时保留 / 确认**、**预约候补队列**、
 **预约时序依赖**：有向最小间隔约束，改期/取消时同事务重验）、
 **会议室批量分配**（会议室 upsert/查询；整批全局求解、
-确定性最优解、整批有解才在单事务内持久化）。
+确定性最优解、整批有解才在单事务内持久化）、
+**预约改期提案**（必批人投票：任一 reject 终止提案，
+最后一票 approve 在同一事务内校验并执行原子改期）。
 
 每位参与者按**本地星期与钟面时刻**填写每周重复的可用区间并给出 IANA 时区
 （如 `Asia/Shanghai`），服务按具体日期应用夏令时（DST）规则，统一换算到 UTC，
@@ -42,11 +44,12 @@ app/
   waitlist.py      # 候补核心：可预约直订/否则入队、request_id 幂等、取消事务内 FIFO 扫描晋升
   dependencies.py  # 时序依赖核心：有向最小间隔约束建边（自环/成环拒绝、幂等）、改期/取消时可达依赖整图重验
   room_assignments.py  # 会议室批量分配核心：会议室 upsert/查询、整批全局求解（确定性最优解）、同事务持久化/释放
+  proposals.py     # 改期提案核心：提案创建（幂等）、必批人投票（一次性/任一否决终止）、最后一票同事务校验并执行改期
   audit.py         # 审计事件：canonical JSON、SHA-256 哈希链追加与整链重验
   db.py            # SQLite 连接管理、建表与无损迁移（补列 / 补 baseline 事件）
   schemas.py       # Pydantic 请求/响应模型
   main.py          # FastAPI 路由
-tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发、时段交换、临时保留、候补 FIFO 晋升、时序依赖、会议室批量分配、哈希链/篡改/迁移）
+tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发、时段交换、临时保留、候补 FIFO 晋升、时序依赖、会议室批量分配、改期提案投票、哈希链/篡改/迁移）
 Dockerfile
 docker-compose.yml
 requirements.txt  # 运行依赖
@@ -89,6 +92,9 @@ docker compose up --build
 `CREATE TABLE IF NOT EXISTS` 幂等无损建立，不影响任何既有数据。
 升级到带**会议室批量分配**的版本后，`meeting_rooms`、
 `room_assignment_batches` 与 `room_assignments` 三张新表同样以
+`CREATE TABLE IF NOT EXISTS` 幂等无损建立，不影响任何既有数据。
+升级到带**改期提案**的版本后，`reschedule_proposals` 与
+`reschedule_proposal_votes` 两张新表同样以
 `CREATE TABLE IF NOT EXISTS` 幂等无损建立，不影响任何既有数据。
 
 服务启动后访问 <http://localhost:8000>（Swagger UI 在 <http://localhost:8000/docs>）。
@@ -1154,6 +1160,179 @@ curl -s 'http://localhost:8000/api/v1/room-assignments?room_id=room-a'
 批次不存在 → `404`。批次成员的分配被后续批次替换、或因预约
 改期/取消/交换释放后，本接口反映最新状态（可能少于求解时的条数）。
 
+### `POST /api/v1/reschedule-proposals`
+
+创建**预约改期提案**：把一次预约改期拆成“提案 + 必批人投票”两步。
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `proposal_id` | 非空字符串（≤200） | 客户端幂等请求标识（独立命名空间） |
+| `reservation_id` | 正整数 | 目标预约 ID（须已存在） |
+| `expected_version` | 正整数 | 提案基于的预约乐观锁版本；最后一票 approve 时预约仍须为该版本且 `active` |
+| `start_utc` / `end_utc` | ISO 8601（须带时区偏移） | 提案的新 UTC 起止时刻；`end_utc` 必须晚于 `start_utc` |
+| `participant_ids` | 非空字符串数组 | 提案的新参与者；**去重并排序后**存储 |
+| `approver_ids` | 非空字符串数组 | 必批人 ID；**去重并排序后**存储，全部 approve 才执行改期 |
+
+语义（整个流程在单个 `BEGIN IMMEDIATE` 事务内完成）：
+
+- 目标预约不存在 → `404`；
+- **幂等**：相同 `proposal_id` + 相同规范化内容（目标预约、期望版本、
+  起止、去重排序参与者、去重排序必批人）重试 → `200` 返回原提案，
+  不新增记录；同键内容不同 → `409`（`existing_proposal_id`）；
+- 成功 → `201`，提案状态为 `pending`。创建**不**校验版本/状态/冲突：
+  这些校验推迟到最后一票 approve 时在同一事务内执行（见下），
+  提案在投票期间**不锁定**预约。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/reschedule-proposals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "proposal_id": "prop-7f3a",
+    "reservation_id": 1,
+    "expected_version": 1,
+    "start_utc": "2026-03-09T15:00:00Z",
+    "end_utc": "2026-03-09T16:00:00Z",
+    "participant_ids": ["alice", "carol"],
+    "approver_ids": ["boss1", "boss2"]
+  }'
+```
+
+成功响应（`201`，幂等重放为 `200`；`reservation` 为目标预约当前状态）：
+
+```json
+{
+  "proposal_id": "prop-7f3a",
+  "reservation_id": 1,
+  "expected_version": 1,
+  "start_utc": "2026-03-09T15:00:00Z",
+  "end_utc": "2026-03-09T16:00:00Z",
+  "participants": ["alice", "carol"],
+  "approvers": ["boss1", "boss2"],
+  "status": "pending",
+  "votes": [],
+  "reservation": {
+    "reservation_id": 1,
+    "request_id": "req-9f3a",
+    "start_utc": "2026-03-09T13:00:00Z",
+    "end_utc": "2026-03-09T14:00:00Z",
+    "participants": ["alice", "bob"],
+    "version": 1,
+    "status": "active",
+    "canceled_at": null,
+    "created_at": "2026-09-17T20:42:39.634009Z"
+  },
+  "created_at": "2026-09-19T10:20:30.123456Z",
+  "resolved_at": null
+}
+```
+
+同 `proposal_id` 内容不同（`409`）：
+
+```json
+{
+  "detail": "proposal_id is already used by reschedule proposal 'prop-7f3a' with different content",
+  "existing_proposal_id": "prop-7f3a"
+}
+```
+
+其他错误：`404`（目标预约不存在）、`422`（`approver_ids` 为空、
+`expected_version < 1`、时间/参与者非法等）。
+
+### `POST /api/v1/reschedule-proposals/{proposal_id}/votes`
+
+对提案投票：每位必批人只能 `approve` 或 `reject` **一次**。请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `approver_id` | 非空字符串 | 投票人 ID（须在提案的必批人列表内） |
+| `decision` | `"approve"` / `"reject"` | 同意改期 / 否决 |
+
+语义（整个流程在单个 `BEGIN IMMEDIATE` 事务内完成）：
+
+- 提案不存在 → `404`；投票人不在必批人列表 → `409`；
+- 该必批人已投票：**重复同票** → `200` 幂等返回当前提案，不重复记录；
+  **改票** → `409`（`existing_decision`）；
+- 提案已终止（`approved` / `rejected`）→ `409`；
+- **`reject`** → `201`：提案立即置为 `rejected`（**任一否决即终止**），
+  预约不做任何变更；
+- **`approve` 且必批人已齐**（最后一票）→ 同一事务内依次：确认预约仍为
+  `expected_version` 且 `active`（否则 `409`，响应给出 `current_version`
+  或取消态）、复用进行中预约/未过期保留的**半开区间冲突检查**（排除自身，
+  否则 `409` + `conflicts`）、重验**全部可达时序依赖**（否则 `409` +
+  `violations` 完整链路），随后执行改期（版本 +1、替换参与者占用）、
+  追加 `rescheduled` 哈希链审计事件并**释放会议室分配**，提案置为
+  `approved`。**任一步失败整体回滚**：提案仍 `pending`、预约不变、
+  该票也不落库——障碍消除后重试同一票即可成功；
+  `BEGIN IMMEDIATE` 写锁把并发最后投票串行化，**改期只会提交一次**；
+- `approve` 但必批人未齐 → `201`，提案继续 `pending`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/reschedule-proposals/prop-7f3a/votes \
+  -H 'Content-Type: application/json' \
+  -d '{"approver_id": "boss1", "decision": "approve"}'
+```
+
+最后一票 approve 通过的响应（`201`；`reservation` 即改期后的最新状态）：
+
+```json
+{
+  "proposal_id": "prop-7f3a",
+  "reservation_id": 1,
+  "expected_version": 1,
+  "start_utc": "2026-03-09T15:00:00Z",
+  "end_utc": "2026-03-09T16:00:00Z",
+  "participants": ["alice", "carol"],
+  "approvers": ["boss1", "boss2"],
+  "status": "approved",
+  "votes": [
+    {"approver_id": "boss1", "decision": "approve", "voted_at": "2026-09-19T10:21:03.000000Z"},
+    {"approver_id": "boss2", "decision": "approve", "voted_at": "2026-09-19T10:22:41.000000Z"}
+  ],
+  "reservation": {
+    "reservation_id": 1,
+    "request_id": "req-9f3a",
+    "start_utc": "2026-03-09T15:00:00Z",
+    "end_utc": "2026-03-09T16:00:00Z",
+    "participants": ["alice", "carol"],
+    "version": 2,
+    "status": "active",
+    "canceled_at": null,
+    "created_at": "2026-09-17T20:42:39.634009Z"
+  },
+  "created_at": "2026-09-19T10:20:30.123456Z",
+  "resolved_at": "2026-09-19T10:22:41.000000Z"
+}
+```
+
+改票（`409`）：
+
+```json
+{
+  "detail": "approver 'boss1' has already voted 'approve' on reschedule proposal 'prop-7f3a'",
+  "existing_decision": "approve"
+}
+```
+
+最后一票时预约版本已漂移（`409`，提案仍 `pending`、该票未落库）：
+
+```json
+{
+  "detail": "expected_version does not match current version of reservation #1",
+  "current_version": 2
+}
+```
+
+### `GET /api/v1/reschedule-proposals/{proposal_id}`
+
+查询提案：状态、已记录投票（按投票时刻、必批人 id 升序）与目标预约的
+**当前最新状态**（含提案外发生的改期/取消，以及提案通过后由本提案执行的
+改期）。提案不存在 → `404`。
+
+```bash
+curl -s http://localhost:8000/api/v1/reschedule-proposals/prop-7f3a
+```
+
 ## 测试覆盖要点
 
 - **春季跳变**：不存在的钟面时刻报错；跨越跳变间隙的窗口 UTC 时长缩短（柏林 2026-03-29 00:00–04:00 实际只有 3 小时）。
@@ -1232,6 +1411,17 @@ curl -s 'http://localhost:8000/api/v1/room-assignments?room_id=room-a'
   列表/过滤/按批次查询（未知批次 404）、改期/取消/交换同事务释放分配
   （失败改期回滚后分配不变）、并发批次竞争同一房间恰一个赢家、
   并发同键重试只建一个批次；旧版库初始化无损新建三张新表且既有数据不动。
+- **改期提案（reschedule proposals）**：创建 201 并规范化参与者/必批人、
+  同 `proposal_id` 幂等重放 200（含规范化等价内容）、同键异内容 409、
+  预约缺失 404、版本/状态校验推迟到最后一票（创建时版本漂移/已取消仍 201）、
+  非法请求 422；投票：非必批人 409、重复同票幂等 200 不重复记录、
+  改票 409 且不终止提案、已终止提案不再接受新投票、任一 reject 立即终止
+  且预约不变；最后一票 approve 同事务执行改期（版本 +1、新时段/参与者生效、
+  旧时段释放新时段占用、`rescheduled` 审计事件可验链、会议室分配释放）；
+  最后一票时版本漂移/预约已取消/参与者冲突/未过期保留冲突/依赖违反均 409，
+  提案仍 pending、该票不落库、预约与审计链不变，障碍消除后重试同一票成功；
+  并发最后投票（同一必批人重复提交、两位必批人同时 approve）改期只提交一次；
+  并发同键创建只建一条提案；旧版库初始化无损新建提案/投票表且既有数据不动。
 
 ```bash
 pytest -q
